@@ -1,0 +1,183 @@
+name: Monitor IPTV File
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write  # 需要写权限来提交文件
+  actions: read
+
+jobs:
+  check_update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: 创建通知脚本
+        run: |
+          cat > send_notify.js << 'EOF'
+          const axios = require('axios');
+          const nodemailer = require('nodemailer');
+
+          async function sendNotify(title, content) {
+          
+            let success = false;
+
+            // 微信通知
+            if (process.env.SERVERCHAN_KEY) {
+              try {
+                const res = await axios.get(`https://sctapi.ftqq.com/${process.env.SERVERCHAN_KEY}.send`, {
+                  params: { title, desp: content }
+                });
+                console.log('微信通知发送成功:');
+                success = true;
+              } catch (err) {
+                console.error('微信通知发送失败:', err.response?.data || err.message);
+              }
+            } else {
+              console.log('未设置 SERVERCHAN_KEY，跳过微信通知');
+            }
+
+            // 邮件通知
+            if (process.env.EMAIL_USER && process.env.EMAIL_PASS && process.env.EMAIL_TO) {
+              const transporter = nodemailer.createTransport({
+                host: 'smtp.163.com',
+                port: 465,
+                secure: true,
+                auth: {
+                  user: process.env.EMAIL_USER,
+                  pass: process.env.EMAIL_PASS
+                }
+              });
+
+              try {
+                const info = await transporter.sendMail({
+                  from: `"IPTV Monitor" <${process.env.EMAIL_USER}>`,
+                  to: process.env.EMAIL_TO,
+                  subject: title,
+                  text: content
+                });
+                console.log('邮件发送成功:');
+                success = true;
+              } catch (err) {
+                console.error('邮件发送失败:', err.message);
+              }
+            } else {
+              console.log('邮件配置不完整，跳过邮件通知');
+            }
+
+            return success;
+          }
+
+          if (require.main === module) {
+            const title = process.argv[2] || '测试标题';
+            const content = process.argv[3] || '测试内容';
+            sendNotify(title, content).catch(console.error);
+          }
+
+          module.exports = sendNotify;
+          EOF
+
+      - name: 安装依赖
+        run: |
+          npm init -y
+          npm install axios nodemailer
+
+      - name: 检查文件更新
+        id: check_update
+        env:
+          SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "正在获取最新的 SHA..."
+          SHA=$(curl -s -H "User-Agent: UpdateChecker" \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            "https://api.github.com/repos/mursor1985/LIVE/commits?path=iptv.m3u" | \
+            jq -r '.[0].sha')
+          
+          if [ "$SHA" = "null" ] || [ -z "$SHA" ]; then
+            echo "❌ 获取 SHA 失败"
+            exit 1
+          fi
+          
+          echo "✅ 获取到最新 SHA: $SHA"
+
+          # 从仓库读取上次的 SHA
+          LAST_SHA=""
+          echo "正在读取上次保存的 SHA..."
+          if git show HEAD:.last_sha.txt 2>/dev/null; then
+            LAST_SHA=$(git show HEAD:.last_sha.txt 2>/dev/null || echo "")
+            echo "📖 读取到上次的 SHA: $LAST_SHA"
+          else
+            echo "📝 首次运行，没有历史记录"
+          fi
+
+          if [ "$SHA" != "$LAST_SHA" ]; then
+            echo "🔄 检测到文件更新！"
+            echo "  旧 SHA: $LAST_SHA"
+            echo "  新 SHA: $SHA"
+            
+            COMMIT_INFO=$(curl -s -H "User-Agent: UpdateChecker" \
+              -H "Authorization: token $GITHUB_TOKEN" \
+              "https://api.github.com/repos/mursor1985/LIVE/commits/$SHA" | \
+              jq -r '.commit.message' | head -1)
+            
+            COMMIT_DATE=$(curl -s -H "User-Agent: UpdateChecker" \
+              -H "Authorization: token $GITHUB_TOKEN" \
+              "https://api.github.com/repos/mursor1985/LIVE/commits/$SHA" | \
+              jq -r '.commit.committer.date')
+            
+            echo "📤 发送更新通知..."
+            node send_notify.js \
+              "🔔 IPTV 文件已更新" \
+              "📺 iptv.m3u 文件有新的更新
+
+          🆔 最新提交: $SHA
+          💬 提交信息: $COMMIT_INFO  
+          ⏰ 提交时间: $COMMIT_DATE
+
+          🔗 查看文件: https://github.com/mursor1985/LIVE/blob/main/iptv.m3u
+          🔗 查看提交: https://github.com/mursor1985/LIVE/commit/$SHA"
+            
+            # 保存新的 SHA 到仓库文件
+            echo "💾 保存新的 SHA 到仓库..."
+            echo "$SHA" > .last_sha.txt
+            
+            # 配置 git
+            git config --local user.email "action@github.com"
+            git config --local user.name "GitHub Action"
+            
+            # 提交更新
+            git add .last_sha.txt
+            if git diff --cached --quiet; then
+              echo "⚠️ 没有变化需要提交"
+            else
+              git commit -m "Update IPTV SHA to $SHA"
+              git push
+              echo "✅ SHA 已保存到仓库"
+            fi
+            echo "updated=true" >> $GITHUB_OUTPUT
+            echo "new_sha=$SHA" >> $GITHUB_OUTPUT
+          else
+            echo "✅ 文件无变化，跳过通知"
+            echo "updated=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 显示运行结果
+        run: |
+          echo "📊 本次运行结果:"
+          echo "  更新状态: ${{ steps.check_update.outputs.updated }}"
+          if [ "${{ steps.check_update.outputs.updated }}" = "true" ]; then
+            echo "  新 SHA: ${{ steps.check_update.outputs.new_sha }}"
+          fi
